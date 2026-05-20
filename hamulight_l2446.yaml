@@ -1,0 +1,265 @@
+substitutions:
+  light_name: "Terrassenlicht"
+  # 24-Bit Hardware Prefix (0xFB934D)
+  rf_key: "1,1,1,1,1,0,1,1,1,0,0,1,0,0,1,1,0,1,0,0,1,1,0,1"
+
+esphome:
+  name: hamulight-control
+  friendly_name: "Hamulight Control"
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced: 
+      sram1_as_iram: true
+
+logger:
+  level: INFO
+
+<<: !include include/generic.yaml
+
+globals:
+  - id: last_rx_time
+    type: uint32_t
+    initial_value: "0"
+  - id: last_tx_time
+    type: uint32_t
+    initial_value: "0"
+
+spi:
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+  clk_pin: GPIO18
+
+cc1101:
+  cs_pin:
+    number: GPIO5
+    ignore_strapping_warning: true
+  frequency: 433.947MHz 
+  modulation_type: ASK/OOK
+  filter_bandwidth: 58kHz
+
+remote_transmitter:
+  - pin:
+      number: GPIO27
+    carrier_duty_percent: 100%
+    non_blocking: false # Block until transmission is complete to prevent self-interference
+
+remote_receiver:
+  id: transmitter_cc1101
+  pin: GPIO26
+  dump: []
+  filter: 150us
+  idle: 4ms
+  on_raw:
+    then:
+      - lambda: |-
+          // TX-Lock: Ignore received signals after sending a command for 1.5s to prevent self-interference
+          if (millis() - id(last_tx_time) < 1500) return;
+          // Ignore very short signals that are unlikely to be valid (e.g., noise)
+          if (x.size() < 96) return; 
+
+          // Signal Cleaning: Merge small gaps (<300ms) into the current mark to reconstruct the original signal structure
+          std::vector<int32_t> clean_x;
+          int32_t current_val = x[0];
+
+          for (size_t i = 1; i < x.size(); i++) {
+            int32_t val = x[i];
+            
+            if (abs(val) < 300) {
+              if ((current_val > 0 && val < 0) || (current_val < 0 && val > 0)) {
+                current_val += (current_val > 0) ? abs(val) : -abs(val);
+              } else {
+                 current_val += val; 
+              }
+            } else {
+              if ((current_val > 0 && val > 0) || (current_val < 0 && val < 0)) {
+                 current_val += val; 
+              } else {
+                 clean_x.push_back(current_val);
+                 current_val = val;
+              }
+            }
+          }
+          clean_x.push_back(current_val);
+
+          if (clean_x.size() < 96) return;
+
+          // Bit Extraction: Convert the cleaned signal into a sequence of bits based on duration thresholds
+          std::vector<bool> bits;
+          
+          for (size_t i = 0; i < clean_x.size() - 1; i++) {
+            int32_t mark = clean_x[i];
+            if (mark < 0) continue; 
+            
+            if (mark > 600) {
+               bits.push_back(true);
+            } else if (mark > 200 && mark <= 600) {
+               bits.push_back(false);
+            }
+          }
+
+          if (bits.size() < 48) return;
+
+          // Prefix Matching: Look for the 24-bit hardware prefix in the bit sequence, allowing for up to 3 bit errors to account for noise and timing variations
+          bool rf_prefix[24] = { ${rf_key} };
+          bool prefix_found = false;
+          size_t match_idx = 0;
+
+          // Fuzzy-Matcher
+          for (size_t start_bit = 0; start_bit <= bits.size() - 24; start_bit++) {
+            int errors = 0;
+            for (size_t b = 0; b < 24; b++) {
+              if (bits[start_bit + b] != rf_prefix[b]) {
+                errors++;
+              }
+            }
+            if (errors <= 3) {
+              prefix_found = true;
+              match_idx = start_bit;
+              break; 
+            }
+          }
+
+          if (!prefix_found) return;
+          if (bits.size() < match_idx + 48) return;
+
+          uint8_t mode = 0;
+          uint8_t state_val = 0;
+          uint8_t checksum = 0;
+          
+          // Data Extraction: Extract mode, state value, and checksum from the bit sequence following the prefix
+          for (int i = 0; i < 8; i++) {
+            if (bits[match_idx + 24 + i]) mode |= (1 << i);
+            if (bits[match_idx + 32 + i]) state_val |= (1 << i);
+            if (bits[match_idx + 40 + i]) checksum |= (1 << i);
+          }
+          
+          uint8_t expected_checksum = 0;
+          // Checksum Calculation: Compute the expected checksum based on the mode and state value, following the protocol's specifications
+          if (mode == 0x03) expected_checksum = (state_val + 0x5D) & 0xFF;
+          else if (mode == 0x02) expected_checksum = (state_val + 0x5C) & 0xFF;
+
+          bool is_valid = (checksum == expected_checksum);
+          // Command Validation: Validate the command based on the mode, state value
+          if ((mode == 0x02 && state_val == 0x00) || (mode == 0x03 && state_val > 0 && state_val <= 255)) is_valid = true;
+
+          if (is_valid) {
+            id(last_rx_time) = millis();
+            
+            if (state_val == 0x00) {
+              auto call = id(hamulight_light).turn_off();
+              call.set_transition_length(0); // No cold-start fade-out, because the light is already off
+              call.perform();
+            } else {
+              auto call = id(hamulight_light).turn_on();
+              call.set_brightness((float)state_val / 255.0f);
+              call.set_transition_length(0); // No cold-start fade-in, because the light is already on at the correct brightness
+              call.perform();
+            }
+            
+            ESP_LOGD("CC1101_RX", "SYNC success. Mode: 0x%02X, State_Val = %d/255 set.", mode, state_val);
+          }
+
+script:
+  - id: blink_led_send
+    then:
+      - output.turn_on: internal_led
+      - delay: 200ms
+      - output.turn_off: internal_led
+
+  - id: send_rf_cmd
+    parameters:
+      mode: uint8_t
+      state_val: uint8_t
+      checksum_base: uint8_t
+    then:
+      - lambda: |-
+          id(last_tx_time) = millis(); // Set TX lock to prevent self-interference with incoming signals
+      - cc1101.set_modulation_type: 2-FSK
+      - cc1101.set_fsk_deviation: 27kHz
+      - cc1101.begin_tx:
+      - remote_transmitter.transmit_raw:
+          code: !lambda |-
+            std::vector<int32_t> payload;
+            
+            // Wake-Up Sequence
+            payload.push_back(-11620);
+            payload.push_back(415);
+            payload.push_back(-13280);
+            // Checksum Calculation: Compute the checksum based on the mode and state value, following the protocol's specifications
+            uint8_t checksum = (state_val + checksum_base) & 0xFF;
+            // Bit Encoding: Convert mode, state value, and checksum into a sequence of bits and then into timing values based on the protocol's specifications
+            auto append_bit = [&payload](bool bit) {
+              if (bit) {
+                payload.push_back(1245); payload.push_back(-415);
+              } else {
+                payload.push_back(415);  payload.push_back(-1245);
+              }
+            };
+            // Byte Encoding: Helper function to append a byte as 8 bits to the payload
+            auto append_byte = [&append_bit](uint8_t b) {
+              for (int i = 0; i < 8; i++) { append_bit((b >> i) & 1); }
+            };
+
+            bool prefix[24] = { ${rf_key} };
+            // Repeat the entire signal 6 times to ensure reliable reception, as the Hamulight Apex L2446 seems to require multiple repetitions of the command for consistent operation
+            for (int rep = 0; rep < 6; rep++) {
+              for (int i = 0; i < 24; i++) { append_bit(prefix[i]); }
+              
+              append_byte(mode);
+              append_byte(state_val);
+              append_byte(checksum);
+
+              payload.push_back(830);
+              payload.push_back(-2490);
+              payload.push_back(415);
+
+              if (rep < 5) {
+                payload.push_back(-13280); 
+              } else {
+                payload.push_back(-32785);
+              }
+            }
+            return payload;
+      - cc1101.set_modulation_type: ASK/OOK
+      - cc1101.begin_rx:
+
+output:
+  - platform: template
+    id: hamulight_rf_out
+    type: float
+    write_action:
+      - lambda: |-
+          if (millis() - id(last_rx_time) < 1500) {
+            return;
+          }
+
+          id(blink_led_send).execute();
+          int bright_val = state * 255;
+          // Command Construction: Determine the appropriate mode and state value based on the desired brightness, and send the corresponding RF command using the send_rf_cmd script. The protocol seems to use mode 0x02 for off (brightness 0) and mode 0x03 for on (brightness > 0), with the state value representing the brightness level.
+          if (bright_val == 0) {
+            id(send_rf_cmd)->execute(0x02, 0x00, 0x5C);
+          } 
+          else if (bright_val == 255) {
+            id(send_rf_cmd)->execute(0x02, 0xFF, 0x5C);
+          } 
+          else {
+            id(send_rf_cmd)->execute(0x03, bright_val, 0x5D);
+          }
+
+  - platform: gpio
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    id: internal_led
+
+light:
+  - platform: monochromatic
+    output: hamulight_rf_out
+    name: ${light_name}
+    id: hamulight_light
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_OFF
