@@ -20,17 +20,26 @@ You need all eight pins to wire up the CC1101 with a ESP for best usage. Check t
 
 ### Software
 
-You can create a complete new device in ESPhome and copy & paste the YAML content and adjust the light name.
-My `generic.yaml` references other ota, time, wifi, api and webserver YAML files. Nothing with special settings.
+You can create a complete new device in ESPhome and copy & paste the YAML content and adjust the light name. My `generic.yaml` references other ota, time, wifi, api and webserver YAML files. Nothing with special settings.
 
-What I can't tell: You may have to adjust the `prefix`  - see **NOTE** below.
-111110111001001101001101 is 111011101110111011101000111011101110100010001110100010001110111010001110100010001110111010001110 as signal and 0xFB934D as hexadecimal.
+### Key detection (if you have a L2446 remote)
+
+The `rf_key: "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"` is a placeholder. Once your device is running, press the ON/OFF button on your remote and you will see something like the below in the log (hopefully):
+
+```log
+[13:46:38.681][W][HAMULIGHT_SNIFFER:151]: Foreign remote control detected! Key for YAML:
+[13:46:38.686][W][HAMULIGHT_SNIFFER:152]: rf_key: "1,1,1,1,1,0,1,1,1,0,0,1,0,0,1,0,1,1,0,1,0,1,0,1"
+```
+
+You should have six entries like this and there is a high chance the rf_key is always the same. If not, use the one which appears the most. Take the rf_key and update the YAML accordingly and flash the update. You are done and the device is ready because it mimics your original L2446.
+
+### Pairing (if you have no L2446 remote)
+
+This setup can completely replace a physical L2446 remote. Set the `rf_key` to any random key or just use the above from the log example. You need to physically switch of the LEDs for at least 10 second, then after turning it back on you can press the pairing button and the LEDs will flash three times. There can only be one remote at the same time.
 
 ### Caveat
 
-The original remote maintains it's own state expecting the light to react accordingly. Thus if signals are send from a virtual remote it has no knowledge about this. So as soon as you use the original remote it will switch back to the state it remembered.
-But there is a logic in place that receives the remotes signals and maintains this values with ESPhome and Homeassitant.
-This is not 100% perfect but perfect enough for me.
+The original remote maintains it's own state expecting the light to react accordingly. Thus if signals are send from a virtual remote it has no knowledge about this. So as soon as you use the original remote it will switch back to the state it remembered. But there is a logic in place that receives the remotes signals and maintains this values with ESPhome and Homeassitant. This is not 100% perfect but perfect enough for me.
 
 ## Technical background
 
@@ -85,3 +94,4 @@ The `signals.txt` contains the extracts of the binary codes from the URH analysi
 ## History
 
 * 2026-05-20 First version
+* 2026-05-26 Pairing & Key detection added

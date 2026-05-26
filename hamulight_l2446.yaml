@@ -1,7 +1,7 @@
 substitutions:
   light_name: "Terrassenlicht"
-  # 24-Bit Hardware Prefix (0xFB934D)
-  rf_key: "1,1,1,1,1,0,1,1,1,0,0,1,0,0,1,1,0,1,0,0,1,1,0,1"
+  # 24-Bit Hardware Prefix
+  rf_key: "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
 
 esphome:
   name: hamulight-control
@@ -16,7 +16,7 @@ esp32:
       sram1_as_iram: true
 
 logger:
-  level: INFO
+  level: WARN
 
 <<: !include include/generic.yaml
 
@@ -56,18 +56,16 @@ remote_receiver:
   on_raw:
     then:
       - lambda: |-
-          // TX-Lock: Ignore received signals after sending a command for 1.5s to prevent self-interference
+          // TX-Lock
           if (millis() - id(last_tx_time) < 1500) return;
-          // Ignore very short signals that are unlikely to be valid (e.g., noise)
           if (x.size() < 96) return; 
 
-          // Signal Cleaning: Merge small gaps (<300ms) into the current mark to reconstruct the original signal structure
+          // Signal Cleaning
           std::vector<int32_t> clean_x;
           int32_t current_val = x[0];
 
           for (size_t i = 1; i < x.size(); i++) {
             int32_t val = x[i];
-            
             if (abs(val) < 300) {
               if ((current_val > 0 && val < 0) || (current_val < 0 && val > 0)) {
                 current_val += (current_val > 0) ? abs(val) : -abs(val);
@@ -84,12 +82,10 @@ remote_receiver:
             }
           }
           clean_x.push_back(current_val);
-
           if (clean_x.size() < 96) return;
 
-          // Bit Extraction: Convert the cleaned signal into a sequence of bits based on duration thresholds
+          // Bit Extraction
           std::vector<bool> bits;
-          
           for (size_t i = 0; i < clean_x.size() - 1; i++) {
             int32_t mark = clean_x[i];
             if (mark < 0) continue; 
@@ -100,68 +96,76 @@ remote_receiver:
                bits.push_back(false);
             }
           }
-
           if (bits.size() < 48) return;
 
-          // Prefix Matching: Look for the 24-bit hardware prefix in the bit sequence, allowing for up to 3 bit errors to account for noise and timing variations
-          bool rf_prefix[24] = { ${rf_key} };
-          bool prefix_found = false;
+          // Reverse-Validation: Checksum Analysis and Protocol Matching
+          bool packet_found = false;
+          uint8_t mode = 0, state_val = 0, checksum = 0;
           size_t match_idx = 0;
 
-          // Fuzzy-Matcher
-          for (size_t start_bit = 0; start_bit <= bits.size() - 24; start_bit++) {
-            int errors = 0;
-            for (size_t b = 0; b < 24; b++) {
-              if (bits[start_bit + b] != rf_prefix[b]) {
-                errors++;
-              }
+          // Sliding Window over the bit stream to find a valid packet structure based on the known protocol (24-bit key + 8-bit mode + 8-bit state + 8-bit checksum)
+          for (size_t start_bit = 0; start_bit <= bits.size() - 48; start_bit++) {
+            mode = 0; state_val = 0; checksum = 0;
+            
+            // Extract Mode (Bits 24-31), State (Bits 32-39) and Checksum (Bits 40-47)
+            for (int i = 0; i < 8; i++) {
+              if (bits[start_bit + 24 + i]) mode |= (1 << i);
+              if (bits[start_bit + 32 + i]) state_val |= (1 << i);
+              if (bits[start_bit + 40 + i]) checksum |= (1 << i);
             }
-            if (errors <= 3) {
-              prefix_found = true;
+
+            uint8_t expected_checksum = 0;
+            bool checksum_valid = false;
+            
+            // Validate Protocol Mathematics
+            if (mode == 0x01) { expected_checksum = (state_val + 0x5B) & 0xFF; checksum_valid = true; }
+            else if (mode == 0x02) { expected_checksum = (state_val + 0x5C) & 0xFF; checksum_valid = true; }
+            else if (mode == 0x03) { expected_checksum = (state_val + 0x5D) & 0xFF; checksum_valid = true; }
+
+            // If the checksum matches, the window is a valid data packet, and we can proceed to extract the key and compare it against our own configuration
+            if (checksum_valid && (checksum == expected_checksum)) {
+              packet_found = true;
               match_idx = start_bit;
               break; 
             }
           }
 
-          if (!prefix_found) return;
-          if (bits.size() < match_idx + 48) return;
+          if (!packet_found) return;
 
-          uint8_t mode = 0;
-          uint8_t state_val = 0;
-          uint8_t checksum = 0;
-          
-          // Data Extraction: Extract mode, state value, and checksum from the bit sequence following the prefix
-          for (int i = 0; i < 8; i++) {
-            if (bits[match_idx + 24 + i]) mode |= (1 << i);
-            if (bits[match_idx + 32 + i]) state_val |= (1 << i);
-            if (bits[match_idx + 40 + i]) checksum |= (1 << i);
+          // Extract the 24-Bit Key as a YAML-compatible string for logging purposes, which can be used to identify foreign remote controls that are not configured with the same key. This is useful for users to update their configuration if they want to integrate additional remotes or identify potential interference from nearby devices using the same protocol.
+          std::string extracted_key = "";
+          for (int i = 0; i < 24; i++) {
+            extracted_key += (bits[match_idx + i] ? "1" : "0");
+            if (i < 23) extracted_key += ",";
           }
-          
-          uint8_t expected_checksum = 0;
-          // Checksum Calculation: Compute the expected checksum based on the mode and state value, following the protocol's specifications
-          if (mode == 0x03) expected_checksum = (state_val + 0x5D) & 0xFF;
-          else if (mode == 0x02) expected_checksum = (state_val + 0x5C) & 0xFF;
 
-          bool is_valid = (checksum == expected_checksum);
-          // Command Validation: Validate the command based on the mode, state value
-          if ((mode == 0x02 && state_val == 0x00) || (mode == 0x03 && state_val > 0 && state_val <= 255)) is_valid = true;
-
-          if (is_valid) {
-            id(last_rx_time) = millis();
-            
-            if (state_val == 0x00) {
-              auto call = id(hamulight_light).turn_off();
-              call.set_transition_length(0); // No cold-start fade-out, because the light is already off
-              call.perform();
-            } else {
-              auto call = id(hamulight_light).turn_on();
-              call.set_brightness((float)state_val / 255.0f);
-              call.set_transition_length(0); // No cold-start fade-in, because the light is already on at the correct brightness
-              call.perform();
-            }
-            
-            ESP_LOGD("CC1101_RX", "SYNC success. Mode: 0x%02X, State_Val = %d/255 set.", mode, state_val);
+          // Calibration with the own configuration key (Tolerance: 3 bit errors allowed to account for signal degradation or noise, which is common in RF communication, while still reliably distinguishing between the own remote and foreign ones)
+          bool rf_prefix[24] = { ${rf_key} };
+          int errors = 0;
+          for (int i = 0; i < 24; i++) {
+            if (bits[match_idx + i] != rf_prefix[i]) errors++;
           }
+
+          // Foreign Key detected -> Only log, cancel action
+          if (errors > 3) {
+            ESP_LOGW("HAMULIGHT_SNIFFER", "Foreign remote control detected! Key for YAML:");
+            ESP_LOGW("HAMULIGHT_SNIFFER", "rf_key: \"%s\"", extracted_key.c_str());
+            return; 
+          }
+
+          // Own Key matched -> Execute Action
+          id(last_rx_time) = millis();
+          if (state_val == 0x00) {
+            auto call = id(hamulight_light).turn_off();
+            call.set_transition_length(0); 
+            call.perform();
+          } else {
+            auto call = id(hamulight_light).turn_on();
+            call.set_brightness((float)state_val / 255.0f);
+            call.set_transition_length(0); 
+            call.perform();
+          }
+          ESP_LOGD("HAMULIGHT_RX", "Locally processed. Mode: 0x%02X, Brightness: %d/255", mode, state_val);
 
 script:
   - id: blink_led_send
@@ -227,15 +231,26 @@ script:
       - cc1101.set_modulation_type: ASK/OOK
       - cc1101.begin_rx:
 
+button:
+  - platform: template
+    name: "Pairing"
+    id: hamulight_pair_button
+    icon: "mdi:link-plus"
+    on_press:
+      - script.execute: blink_led_send
+      - script.execute:
+          id: send_rf_cmd
+          mode: 0x01
+          state_val: 0x00
+          checksum_base: 0x5B
+
 output:
   - platform: template
     id: hamulight_rf_out
     type: float
     write_action:
       - lambda: |-
-          if (millis() - id(last_rx_time) < 1500) {
-            return;
-          }
+          if (millis() - id(last_rx_time) < 1500) { return; }
 
           id(blink_led_send).execute();
           int bright_val = state * 255;

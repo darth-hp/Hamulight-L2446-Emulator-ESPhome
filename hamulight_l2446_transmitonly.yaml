@@ -1,7 +1,7 @@
 substitutions:
   light_name: "Terrassenlicht"
-  # 24-Bit Hardware Prefix (0xFB934D)
-  rf_key: "1,1,1,1,1,0,1,1,1,0,0,1,0,0,1,1,0,1,0,0,1,1,0,1"
+  # 24-Bit Hardware Prefix
+  rf_key: "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
 
 esphome:
   name: hamulight-control
@@ -16,7 +16,7 @@ esp32:
       sram1_as_iram: true
 
 logger:
-  level: INFO
+  level: WARN
 
 <<: !include include/generic.yaml
 
@@ -102,6 +102,19 @@ script:
             }
             return payload;
       - script.execute: blink_led_send
+
+button:
+  - platform: template
+    name: "Pairing"
+    id: hamulight_pair_button
+    icon: "mdi:link-plus"
+    on_press:
+      - script.execute: blink_led_send
+      - script.execute:
+          id: send_rf_cmd
+          mode: 0x01
+          state_val: 0x00
+          checksum_base: 0x5B
 
 output:
   - platform: template
