@@ -27,6 +27,9 @@ globals:
   - id: last_tx_time
     type: uint32_t
     initial_value: "0"
+  - id: is_rx_updating
+    type: bool
+    initial_value: "false"
 
 spi:
   mosi_pin: GPIO23
@@ -155,16 +158,20 @@ remote_receiver:
 
           // Own Key matched -> Execute Action
           id(last_rx_time) = millis();
+          id(is_rx_updating) = true;
+
           if (state_val == 0x00) {
-            auto call = id(hamulight_light).turn_off();
+            auto call = id(hamulight_light)->turn_off();
             call.set_transition_length(0); 
             call.perform();
           } else {
-            auto call = id(hamulight_light).turn_on();
+            auto call = id(hamulight_light)->turn_on();
             call.set_brightness((float)state_val / 255.0f);
             call.set_transition_length(0); 
             call.perform();
           }
+
+          id(is_rx_updating) = false;
           ESP_LOGD("HAMULIGHT_RX", "Locally processed. Mode: 0x%02X, Brightness: %d/255", mode, state_val);
 
 script:
@@ -175,6 +182,7 @@ script:
       - output.turn_off: internal_led
 
   - id: send_rf_cmd
+    mode: queued
     parameters:
       mode: uint8_t
       state_val: uint8_t
@@ -185,6 +193,7 @@ script:
       - cc1101.set_modulation_type: 2-FSK
       - cc1101.set_fsk_deviation: 27kHz
       - cc1101.begin_tx:
+      - delay: 5ms
       - remote_transmitter.transmit_raw:
           code: !lambda |-
             std::vector<int32_t> payload;
@@ -228,6 +237,7 @@ script:
               }
             }
             return payload;
+      - delay: 5ms
       - cc1101.set_modulation_type: ASK/OOK
       - cc1101.begin_rx:
 
@@ -250,19 +260,22 @@ output:
     type: float
     write_action:
       - lambda: |-
-          if (millis() - id(last_rx_time) < 1500) { return; }
+          if (id(is_rx_updating)) { return; }
 
-          id(blink_led_send).execute();
-          int bright_val = state * 255;
+          id(blink_led_send)->execute();
+          int bright_val = (int)roundf(state * 255.0f);
           // Command Construction: Determine the appropriate mode and state value based on the desired brightness, and send the corresponding RF command using the send_rf_cmd script. The protocol seems to use mode 0x02 for off (brightness 0) and mode 0x03 for on (brightness > 0), with the state value representing the brightness level.
-          if (bright_val == 0) {
+          if (bright_val <= 0) {
             id(send_rf_cmd)->execute(0x02, 0x00, 0x5C);
           } 
-          else if (bright_val == 255) {
+          else if (bright_val >= 255) {
             id(send_rf_cmd)->execute(0x02, 0xFF, 0x5C);
           } 
           else {
-            id(send_rf_cmd)->execute(0x03, bright_val, 0x5D);
+            if (bright_val < 3) {
+              bright_val = 3;
+            }
+            id(send_rf_cmd)->execute(0x03, (uint8_t)bright_val, 0x5D);
           }
 
   - platform: gpio
@@ -277,4 +290,5 @@ light:
     name: ${light_name}
     id: hamulight_light
     default_transition_length: 0s
+    gamma_correct: 0
     restore_mode: RESTORE_DEFAULT_OFF
