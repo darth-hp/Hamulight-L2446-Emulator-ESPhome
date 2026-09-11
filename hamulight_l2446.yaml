@@ -48,7 +48,7 @@ remote_transmitter:
   - pin:
       number: GPIO27
     carrier_duty_percent: 100%
-    non_blocking: false # Block until transmission is complete to prevent self-interference
+    non_blocking: true # Run in background via RMT to prevent blocking the main loop (>50ms warning)
 
 remote_receiver:
   id: transmitter_cc1101
@@ -192,8 +192,8 @@ script:
           id(last_tx_time) = millis(); // Set TX lock to prevent self-interference with incoming signals
       - cc1101.set_modulation_type: 2-FSK
       - cc1101.set_fsk_deviation: 27kHz
-      - cc1101.begin_tx:
       - delay: 5ms
+      - cc1101.begin_tx:
       - remote_transmitter.transmit_raw:
           code: !lambda |-
             std::vector<int32_t> payload;
@@ -237,7 +237,7 @@ script:
               }
             }
             return payload;
-      - delay: 5ms
+      - delay: 600ms
       - cc1101.set_modulation_type: ASK/OOK
       - cc1101.begin_rx:
 
@@ -263,19 +263,31 @@ output:
           if (id(is_rx_updating)) { return; }
 
           id(blink_led_send)->execute();
-          int bright_val = (int)roundf(state * 255.0f);
+          int raw_val = (int)roundf(state * 255.0f);
+
           // Command Construction: Determine the appropriate mode and state value based on the desired brightness, and send the corresponding RF command using the send_rf_cmd script. The protocol seems to use mode 0x02 for off (brightness 0) and mode 0x03 for on (brightness > 0), with the state value representing the brightness level.
-          if (bright_val <= 0) {
+          if (raw_val <= 0) {
             id(send_rf_cmd)->execute(0x02, 0x00, 0x5C);
-          } 
-          else if (bright_val >= 255) {
-            id(send_rf_cmd)->execute(0x02, 0xFF, 0x5C);
-          } 
-          else {
-            if (bright_val < 3) {
-              bright_val = 3;
+            return;
+          }
+
+          // Feste Stufen der Original-Fernbedienung (D1 bis D9 + ON)
+          const uint8_t STEPS[10] = {3, 31, 59, 87, 115, 143, 171, 199, 227, 255};
+          uint8_t target_val = STEPS[0];
+          int min_diff = 999;
+
+          for (int i = 0; i < 10; i++) {
+            int diff = abs(raw_val - (int)STEPS[i]);
+            if (diff < min_diff) {
+              min_diff = diff;
+              target_val = STEPS[i];
             }
-            id(send_rf_cmd)->execute(0x03, (uint8_t)bright_val, 0x5D);
+          }
+
+          if (target_val == 255) {
+            id(send_rf_cmd)->execute(0x02, 0xFF, 0x5C);
+          } else {
+            id(send_rf_cmd)->execute(0x03, target_val, 0x5D);
           }
 
   - platform: gpio
